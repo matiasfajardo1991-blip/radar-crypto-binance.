@@ -7,7 +7,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-BASE_URL = "https://api.binance.com"
+BASE_URL = "https://api1.binance.com"
 MIN_VOLUME_24H = 2_000_000
 MAX_SYMBOLS = 15
 
