@@ -1,29 +1,72 @@
 
-
 import json
 import os
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 
-BASE_URL = "https://api1.binance.com"
+# Radar: analisis solamente, sin operaciones reales.
+BASE_URLS = [
+    "https://data-api.binance.vision",
+    "https://api1.binance.com",
+    "https://api-gcp.binance.com",
+    "https://api.binance.com",
+]
+
 MIN_VOLUME_24H = 2_000_000
 MAX_SYMBOLS = 15
+REQUEST_TIMEOUT = 15
 
 
 def api_get(path, params=None):
-    url = BASE_URL + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
+    query = urllib.parse.urlencode(params or {})
+    last_error = None
 
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "RadarCryptoBinance/1.0"}
+    for base_url in BASE_URLS:
+        url = base_url + path
+        if query:
+            url += "?" + query
+
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "RadarCryptoBinance/2.0"}
+        )
+
+        try:
+            with urllib.request.urlopen(
+                request, timeout=REQUEST_TIMEOUT
+            ) as response:
+                data = response.read().decode("utf-8")
+                print(f"API OK: {base_url}")
+                return json.loads(data)
+
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode(
+                "utf-8", errors="replace"
+            )
+            last_error = (
+                f"HTTP {error.code} en {base_url}: {detail}"
+            )
+            print("API ERROR:", last_error)
+
+            # Try another official endpoint for access/server errors.
+            if error.code not in (403, 429, 451) and error.code < 500:
+                raise
+
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            last_error = f"{base_url}: {error}"
+            print("API ERROR:", last_error)
+
+        except json.JSONDecodeError as error:
+            last_error = f"JSON invalido en {base_url}: {error}"
+            print("API ERROR:", last_error)
+
+    raise RuntimeError(
+        "No se pudo consultar ningun endpoint de Binance. "
+        f"Ultimo error: {last_error}"
     )
-
-    with urllib.request.urlopen(request, timeout=15) as response:
-        return json.loads(response.read().decode("utf-8"))
 
 
 def get_candidates():
@@ -72,7 +115,7 @@ def analyze(item):
         {"symbol": symbol, "interval": "5m", "limit": 13}
     )
 
-    # Ignore the current, unfinished candle.
+    # Ignore the current unfinished candle.
     candles = candles[:-1]
 
     if len(candles) < 12:
@@ -83,26 +126,29 @@ def analyze(item):
 
     first_open = float(recent[0][1])
     last_close = float(recent[-1][4])
-    last_open = float(recent[-1][1])
 
-    if first_open <= 0 or last_open <= 0:
+    if first_open <= 0:
+        return None
+
+    # Change across the six completed 5-minute candles.
+    change30m = (last_close / first_open - 1) * 100
+
+    # Change of the latest completed 5-minute candle.
+    candle_open = float(recent[-1][1])
+    if candle_open <= 0:
         return None
 
     change5m = (
-        float(recent[-1][4]) / last_open - 1
-    ) * 100
-
-    change30m = (
-        last_close / first_open - 1
+        float(recent[-1][4]) / candle_open - 1
     ) * 100
 
     previous_volume = sum(float(c[7]) for c in previous)
     recent_volume = sum(float(c[7]) for c in recent)
 
-    if previous_volume > 0:
-        volume_ratio = recent_volume / previous_volume
-    else:
-        volume_ratio = 0
+    volume_ratio = (
+        recent_volume / previous_volume
+        if previous_volume > 0 else 0
+    )
 
     score = 0
 
@@ -138,11 +184,10 @@ def send_telegram(message):
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
     if not token or not chat_id:
+        print("Telegram no configurado; se omiten alertas.")
         return
 
-    url = (
-        f"https://api.telegram.org/bot{token}/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = urllib.parse.urlencode({
         "chat_id": chat_id,
         "text": message
@@ -151,21 +196,25 @@ def send_telegram(message):
     request = urllib.request.Request(url, data=data)
 
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(
+            request, timeout=REQUEST_TIMEOUT
+        ) as response:
             response.read()
+        print("Alerta enviada por Telegram.")
     except Exception as error:
         print("No se pudo enviar Telegram:", error)
 
 
 def main():
     now = datetime.now(timezone.utc).isoformat()
+
     print(f"\nRADAR CRYPTO BINANCE | {now}")
-    print("Modo: análisis solamente. No ejecuta operaciones.")
+    print("Modo: analisis solamente. No ejecuta operaciones.")
 
     try:
         candidates = get_candidates()
     except Exception as error:
-        print("Error consultando Binance:", error)
+        print(f"Error consultando Binance: {error}")
         return
 
     results = []
@@ -173,6 +222,7 @@ def main():
     for item in candidates:
         try:
             result = analyze(item)
+
             if result:
                 results.append(result)
                 print(
@@ -180,14 +230,18 @@ def main():
                     f"5m: {result['change5m_pct']}% | "
                     f"30m: {result['change30m_pct']}% | "
                     f"Volumen: x{result['volume_ratio']} | "
-                    f"Puntos: {result['score']}"
+                    f"Puntos: {result['score']}/4"
                 )
+
             time.sleep(0.15)
+
         except Exception as error:
             print(f"Error analizando {item['symbol']}: {error}")
 
     results.sort(
-        key=lambda x: (x["signal"], x["score"], x["change30m_pct"]),
+        key=lambda x: (
+            x["signal"], x["score"], x["change30m_pct"]
+        ),
         reverse=True
     )
 
@@ -202,27 +256,34 @@ def main():
         "results": results
     }
 
-    with open("radar_data/latest.json", "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
+    with open(
+        "radar_data/latest.json", "w", encoding="utf-8"
+    ) as file:
+        json.dump(report, file, ensure_ascii=False, indent=2)
 
     print(f"\nMonedas analizadas: {len(results)}")
-    print(f"Señales detectadas: {len(signals)}")
+    print(f"Senales detectadas: {len(signals)}")
 
     if signals:
-        lines = ["Radar Crypto Binance — posibles movimientos:"]
-        for r in signals[:10]:
+        lines = [
+            "Radar Crypto Binance - posibles movimientos:"
+        ]
+
+        for result in signals[:10]:
             lines.append(
-                f"{r['symbol']}: 30m {r['change30m_pct']}%, "
-                f"volumen x{r['volume_ratio']}, "
-                f"puntos {r['score']}/4"
+                f"{result['symbol']}: "
+                f"30m {result['change30m_pct']}%, "
+                f"volumen x{result['volume_ratio']}, "
+                f"puntos {result['score']}/4"
             )
+
         message = "\n".join(lines)
         print(message)
         send_telegram(message)
     else:
-        print("Sin señales que cumplan los criterios actuales.")
+        print("Sin senales que cumplan los criterios actuales.")
 
-    print("\nFin del análisis.")
+    print("\nFin del analisis.")
 
 
 if __name__ == "__main__":
